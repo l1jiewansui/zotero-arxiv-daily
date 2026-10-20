@@ -39,14 +39,14 @@ jobs:
           import urllib.parse
           import urllib.request
           import uuid
-          
+
           API = 'https://api.zotero.org'
           KEY = os.environ['ZOTERO_KEY'].strip()
           USER = os.environ['ZOTERO_ID'].strip()
           assert USER.isdigit(), 'ZOTERO_ID must be a user ID'
           PREFIX = '/users/' + USER
-          
-          
+
+
           def request(method, path, data=None, headers=None):
               body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
               h = {'Zotero-API-Key': KEY, 'Zotero-API-Version': '3', 'Content-Type': 'application/json'}
@@ -69,33 +69,33 @@ jobs:
                   except urllib.error.URLError:
                       raise RuntimeError('Unable to connect to Zotero') from None
               raise RuntimeError('Zotero retry limit exceeded')
-          
-          
+
+
           def all_objects(endpoint):
               objects = []
               while True:
                   batch = request('GET', PREFIX + endpoint + '?format=json&limit=100&start=' + str(len(objects)))
                   objects.extend(batch)
                   if len(batch) < 100: return objects
-          
-          
+
+
           def normalized(value):
               value = unicodedata.normalize('NFKC', html.unescape(value or ''))
               return re.sub('[^a-z0-9]', '', re.sub('<[^>]+>', '', value).lower())
-          
-          
+
+
           def doi(value):
               return re.sub(r'^https?://(?:dx\.)?doi\.org/', '', (value or '').strip().lower())
-          
-          
+
+
           def matches(source, existing):
               sd, ed = doi(source.get('DOI')), doi(existing.get('DOI'))
               if sd and ed: return sd == ed
               a, b = normalized(source['title']), normalized(existing.get('title'))
               if not a or not b: return False
               return a == b or (min(len(a), len(b)) > 60 and difflib.SequenceMatcher(None, a, b).ratio() > .95)
-          
-          
+
+
           def write_batch(endpoint, data):
               result = request('POST', PREFIX + endpoint, data, {'Zotero-Write-Token': uuid.uuid4().hex})
               if result.get('failed'):
@@ -103,8 +103,8 @@ jobs:
                   codes = [str(e.get('code', 'unknown')) for e in result['failed'].values()]
                   raise RuntimeError('Zotero rejected ' + str(len(codes)) + ' objects; status: ' + ','.join(codes))
               return result
-          
-          
+
+
           def run():
               event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
               inputs = event.get('inputs', {})
@@ -115,18 +115,20 @@ jobs:
               permissions = request('GET', '/keys/' + urllib.parse.quote(KEY, safe=''))
               assert str(permissions.get('userID')) == USER, 'API key and configured library user differ'
               can_write = bool(permissions.get('access', {}).get('user', {}).get('write'))
+              account_matches = USER == str(source[0].get('_expectedUserID', USER))
               existing = all_objects('/items/top')
               existing = [x for x in existing if x['data']['itemType'] not in ('attachment', 'note', 'annotation')]
               found = [[x for x in existing if matches(s, x['data'])] for s in source]
               new = [s for s, hits in zip(source, found) if not hits]
-              summary = {'source_papers': len(source), 'cloud_papers_before': len(existing), 'already_in_cloud': len(source) - len(new), 'missing_from_cloud': len(new), 'write_access': can_write, 'applied': False}
+              summary = {'source_papers': len(source), 'cloud_papers_before': len(existing), 'already_in_cloud': len(source) - len(new), 'missing_from_cloud': len(new), 'write_access': can_write, 'configured_account_matches': account_matches, 'applied': False}
               print(json.dumps(summary))
               if not apply:
                   pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('## Zotero update preview\n\n```json\n' + json.dumps(summary, indent=2) + '\n```\n')
                   return
+              assert account_matches, 'Signed-in Zotero account differs from the GitHub-configured library. No changes were made.'
               if not can_write:
                   raise RuntimeError('ZOTERO_KEY has read access only. No library changes were made. Sign into Zotero to import these records.')
-          
+
               # Validate all fields against current Zotero templates before any write.
               templates = {}
               prepared = []
@@ -171,8 +173,8 @@ jobs:
               final = {'source_papers': len(source), 'new_papers_created': len(new), 'existing_papers_reused': len(source) - len(new), 'collection_papers_verified': len(after), 'applied': True}
               print('Cloud Zotero update verified: ' + json.dumps(final))
               pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('## Zotero cloud update verified\n\n```json\n' + json.dumps(final, indent=2) + '\n```\n\nUpdated collection: 2026论文\n')
-          
-          
+
+
           if __name__ == '__main__':
               try:
                   run()
