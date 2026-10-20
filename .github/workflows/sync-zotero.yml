@@ -1,0 +1,182 @@
+name: Update Zotero library
+on:
+  workflow_dispatch:
+    inputs:
+      catalog:
+        description: "Paper metadata JSON array"
+        required: true
+        type: string
+      apply:
+        description: "Apply verified metadata to the configured Zotero library"
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: zotero-library-update
+  cancel-in-progress: false
+jobs:
+  update-library:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check and update the configured Zotero library
+        env:
+          ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
+          ZOTERO_KEY: ${{ secrets.ZOTERO_KEY }}
+        run: |
+          python3 - <<'PY'
+          import copy
+          import difflib
+          import html
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          import time
+          import unicodedata
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import uuid
+          
+          API = 'https://api.zotero.org'
+          KEY = os.environ['ZOTERO_KEY'].strip()
+          USER = os.environ['ZOTERO_ID'].strip()
+          assert USER.isdigit(), 'ZOTERO_ID must be a user ID'
+          PREFIX = '/users/' + USER
+          
+          
+          def request(method, path, data=None, headers=None):
+              body = None if data is None else json.dumps(data, ensure_ascii=False).encode()
+              h = {'Zotero-API-Key': KEY, 'Zotero-API-Version': '3', 'Content-Type': 'application/json'}
+              h.update(headers or {})
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(API + path, data=body, headers=h, method=method)
+                      with urllib.request.urlopen(req, timeout=45) as response:
+                          raw = response.read()
+                          result = json.loads(raw) if raw else None
+                          backoff = int(response.headers.get('Backoff', '0'))
+                      if backoff: time.sleep(min(backoff, 55))
+                      return result
+                  except urllib.error.HTTPError as error:
+                      if error.code in (429, 503) and attempt < 3:
+                          time.sleep(min(int(error.headers.get('Retry-After', '15')), 55))
+                          continue
+                      # Never include request URLs: the key-info endpoint contains a key.
+                      raise RuntimeError('Zotero returned HTTP ' + str(error.code)) from None
+                  except urllib.error.URLError:
+                      raise RuntimeError('Unable to connect to Zotero') from None
+              raise RuntimeError('Zotero retry limit exceeded')
+          
+          
+          def all_objects(endpoint):
+              objects = []
+              while True:
+                  batch = request('GET', PREFIX + endpoint + '?format=json&limit=100&start=' + str(len(objects)))
+                  objects.extend(batch)
+                  if len(batch) < 100: return objects
+          
+          
+          def normalized(value):
+              value = unicodedata.normalize('NFKC', html.unescape(value or ''))
+              return re.sub('[^a-z0-9]', '', re.sub('<[^>]+>', '', value).lower())
+          
+          
+          def doi(value):
+              return re.sub(r'^https?://(?:dx\.)?doi\.org/', '', (value or '').strip().lower())
+          
+          
+          def matches(source, existing):
+              sd, ed = doi(source.get('DOI')), doi(existing.get('DOI'))
+              if sd and ed: return sd == ed
+              a, b = normalized(source['title']), normalized(existing.get('title'))
+              if not a or not b: return False
+              return a == b or (min(len(a), len(b)) > 60 and difflib.SequenceMatcher(None, a, b).ratio() > .95)
+          
+          
+          def write_batch(endpoint, data):
+              result = request('POST', PREFIX + endpoint, data, {'Zotero-Write-Token': uuid.uuid4().hex})
+              if result.get('failed'):
+                  # Field errors do not contain credentials, but report only status counts.
+                  codes = [str(e.get('code', 'unknown')) for e in result['failed'].values()]
+                  raise RuntimeError('Zotero rejected ' + str(len(codes)) + ' objects; status: ' + ','.join(codes))
+              return result
+          
+          
+          def run():
+              event = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+              inputs = event.get('inputs', {})
+              source = json.loads(inputs.get('catalog', '[]'))
+              assert isinstance(source, list) and 1 <= len(source) <= 50, 'Expected 1-50 paper records'
+              assert all(isinstance(x, dict) and x.get('title') and x.get('abstractNote') for x in source), 'Missing paper metadata'
+              apply = str(inputs.get('apply', 'false')).lower() == 'true'
+              permissions = request('GET', '/keys/' + urllib.parse.quote(KEY, safe=''))
+              assert str(permissions.get('userID')) == USER, 'API key and configured library user differ'
+              can_write = bool(permissions.get('access', {}).get('user', {}).get('write'))
+              existing = all_objects('/items/top')
+              existing = [x for x in existing if x['data']['itemType'] not in ('attachment', 'note', 'annotation')]
+              found = [[x for x in existing if matches(s, x['data'])] for s in source]
+              new = [s for s, hits in zip(source, found) if not hits]
+              summary = {'source_papers': len(source), 'cloud_papers_before': len(existing), 'already_in_cloud': len(source) - len(new), 'missing_from_cloud': len(new), 'write_access': can_write, 'applied': False}
+              print(json.dumps(summary))
+              if not apply:
+                  pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('## Zotero update preview\n\n```json\n' + json.dumps(summary, indent=2) + '\n```\n')
+                  return
+              if not can_write:
+                  raise RuntimeError('ZOTERO_KEY has read access only. No library changes were made. Sign into Zotero to import these records.')
+          
+              # Validate all fields against current Zotero templates before any write.
+              templates = {}
+              prepared = []
+              for s in source:
+                  kind = s['itemType']
+                  if kind not in templates:
+                      templates[kind] = request('GET', '/items/new?itemType=' + urllib.parse.quote(kind))
+                  template = copy.deepcopy(templates[kind])
+                  for k, v in s.items():
+                      if k in template: template[k] = v
+                  template.pop('key', None)
+                  template.pop('version', None)
+                  prepared.append(template)
+              collections = all_objects('/collections')
+              collection = next((x for x in collections if x['data']['name'] == '2026论文' and not x['data'].get('parentCollection')), None)
+              if collection is None:
+                  created = write_batch('/collections', [{'name': '2026论文', 'parentCollection': False}])
+                  if 'successful' in created:
+                      collection_key = created['successful']['0']['key']
+                  else:
+                      collection_key = created['success']['0']
+              else:
+                  collection_key = collection['key']
+              writes = []
+              for incoming, hits in zip(prepared, found):
+                  if not hits:
+                      incoming['collections'] = [collection_key]
+                      writes.append(incoming)
+                      continue
+                  # Reuse the first duplicate already in the cloud. Preserve all user data.
+                  item = hits[0]['data']
+                  changed = {'key': item['key'], 'version': item['version']}
+                  if collection_key not in item.get('collections', []):
+                      changed['collections'] = item.get('collections', []) + [collection_key]
+                  for k in ('abstractNote', 'DOI', 'url', 'creators'):
+                      if k in incoming and not item.get(k) and incoming[k]: changed[k] = incoming[k]
+                  if len(changed) > 2: writes.append(changed)
+              if writes: write_batch('/items', writes)
+              after = all_objects('/collections/' + collection_key + '/items/top')
+              absent = [s for s in source if not any(matches(s, x['data']) for x in after)]
+              assert not absent, 'Post-write verification failed'
+              final = {'source_papers': len(source), 'new_papers_created': len(new), 'existing_papers_reused': len(source) - len(new), 'collection_papers_verified': len(after), 'applied': True}
+              print('Cloud Zotero update verified: ' + json.dumps(final))
+              pathlib.Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('## Zotero cloud update verified\n\n```json\n' + json.dumps(final, indent=2) + '\n```\n\nUpdated collection: 2026论文\n')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  run()
+              except Exception as error:
+                  print('::error::' + str(error).replace(KEY, '[redacted]'))
+                  sys.exit(1)
+          PY
