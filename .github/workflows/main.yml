@@ -1,6 +1,11 @@
 name: Send emails daily
 on:
   workflow_dispatch:
+    inputs:
+      test_email:
+        description: "Send a test email without fetching papers"
+        type: boolean
+        default: false
   schedule:
     # 06:17 Asia/Shanghai; avoid the busy top of the hour.
     - cron: '17 22 * * *'
@@ -28,8 +33,13 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+          EMAIL_TEST: ${{ inputs.test_email && 'true' || 'false' }}
         run: |
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+          if [ "$EMAIL_TEST" = "true" ]; then
+            uv run python -c 'import socket; socket.setdefaulttimeout(30); from omegaconf import OmegaConf; from zotero_arxiv_daily.utils import send_email; config = OmegaConf.load("config/custom.yaml"); send_email(config, "<h2>Daily arXiv 邮件发送测试</h2><p>邮箱发送链路已恢复。此邮件仅用于测试，不包含论文推荐。</p><p>每日任务计划于北京时间 06:17 启动。</p>"); print("SMTP test email sent successfully")'
+          else
+            uv run src/zotero_arxiv_daily/main.py
+          fi
