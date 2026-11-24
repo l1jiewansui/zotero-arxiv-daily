@@ -26,12 +26,11 @@ def _raise_runtime_error() -> None:
 def test_arxiv_retriever(config, monkeypatch):
 
     parsed_result = feedparser.parse("tests/retriever/arxiv_rss_example.xml")
-    raw_parser = feedparser.parse
-    def mock_feedparser_parse(url):
-        if url == f"https://rss.arxiv.org/atom/{'+'.join(config.source.arxiv.category)}":
-            return parsed_result
-        return raw_parser(url)
-    monkeypatch.setattr(feedparser, "parse", mock_feedparser_parse)
+    from pathlib import Path
+    monkeypatch.setattr(arxiv_retriever.requests, "get", lambda *a, **k: SimpleNamespace(
+        content=Path("tests/retriever/arxiv_rss_example.xml").read_bytes(),
+        raise_for_status=lambda: None,
+    ))
 
     retriever = ArxivRetriever(config)
     papers = retriever.retrieve_papers()
@@ -163,3 +162,46 @@ def test_run_with_hard_timeout_returns_none_on_failure(monkeypatch):
 
     assert result is None
     assert warnings == ["test operation failed for paper: RuntimeError: boom"]
+
+
+def test_invalid_feed_is_not_treated_as_no_papers(config, monkeypatch):
+    import pytest
+    monkeypatch.setattr(arxiv_retriever.requests, "get", lambda *a, **k: SimpleNamespace(
+        content=b"<html><title>Service unavailable</title></html>",
+        raise_for_status=lambda: None,
+    ))
+    with pytest.raises(ValueError, match="Invalid arXiv Atom"):
+        ArxivRetriever(config)._retrieve_raw_papers()
+
+
+def test_valid_empty_feed(config, monkeypatch):
+    monkeypatch.setattr(arxiv_retriever.requests, "get", lambda *a, **k: SimpleNamespace(
+        content=b'<feed xmlns="http://www.w3.org/2005/Atom"><title>arXiv</title><updated>2026-11-22T05:00:00Z</updated></feed>',
+        raise_for_status=lambda: None,
+    ))
+    assert ArxivRetriever(config)._retrieve_raw_papers() == []
+
+
+def test_feed_http_error_propagates(config, monkeypatch):
+    import pytest
+    def fail():
+        raise arxiv_retriever.requests.HTTPError("503 unavailable")
+    monkeypatch.setattr(arxiv_retriever.requests, "get", lambda *a, **k: SimpleNamespace(raise_for_status=fail))
+    with pytest.raises(arxiv_retriever.requests.HTTPError):
+        ArxivRetriever(config)._retrieve_raw_papers()
+
+
+def test_feed_filters_announcement_types(config, monkeypatch):
+    from pathlib import Path
+    parsed = feedparser.parse("tests/retriever/arxiv_rss_example.xml")
+    expected = [e.id.removeprefix("oai:arXiv.org:") for e in parsed.entries if e.get("arxiv_announce_type", "new") == "new"]
+    monkeypatch.setattr(arxiv_retriever.requests, "get", lambda *a, **k: SimpleNamespace(
+        content=Path("tests/retriever/arxiv_rss_example.xml").read_bytes(), raise_for_status=lambda: None,
+    ))
+    seen = []
+    def results(search):
+        seen.extend(search.id_list)
+        return iter(search.id_list)
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", lambda **k: SimpleNamespace(results=results))
+    assert ArxivRetriever(config)._retrieve_raw_papers() == expected
+    assert seen == expected

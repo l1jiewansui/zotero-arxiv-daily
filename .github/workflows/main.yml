@@ -7,8 +7,8 @@ on:
         type: boolean
         default: false
   schedule:
-    # 06:23 Asia/Shanghai; avoid the busy top of the hour.
-    - cron: '23 22 * * *'
+    # 14:23 Asia/Shanghai; after the arXiv RSS midnight Eastern update (13:00 in winter).
+    - cron: '23 6 * * *'
 
 jobs:
   calculate-and-send:
@@ -39,7 +39,7 @@ jobs:
           echo "Use custom config: "
           cat config/custom.yaml
           if [ "$EMAIL_TEST" = "true" ]; then
-            uv run python -c 'import socket; socket.setdefaulttimeout(30); from omegaconf import OmegaConf; from zotero_arxiv_daily.utils import send_email; config = OmegaConf.load("config/custom.yaml"); send_email(config, "<h2>Daily arXiv 邮件发送测试</h2><p>邮箱发送链路已恢复。此邮件仅用于测试，不包含论文推荐。</p><p>每日任务计划于北京时间 06:23 启动。</p>"); print("SMTP test email sent successfully")'
+            uv run python -c 'import socket; socket.setdefaulttimeout(30); from omegaconf import OmegaConf; from zotero_arxiv_daily.utils import send_email; config = OmegaConf.load("config/custom.yaml"); send_email(config, "<h2>Daily arXiv 邮件发送测试</h2><p>邮箱发送链路已恢复。此邮件仅用于测试，不包含论文推荐。</p><p>每日任务计划于北京时间 14:23 启动。</p>"); print("SMTP test email sent successfully")'
           else
             uv run src/zotero_arxiv_daily/main.py
           fi

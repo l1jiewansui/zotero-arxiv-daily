@@ -117,7 +117,13 @@ class ArxivRetriever(BaseRetriever):
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        url = f"https://rss.arxiv.org/atom/{query}"
+        response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        if feed.get("bozo") or feed.get("version") != "atom10" or not feed.feed.get("title") or not feed.feed.get("updated"):
+            raise ValueError(f"Invalid arXiv Atom response from {url}: {feed.get('bozo_exception', 'missing Atom metadata')}")
+        logger.info(f"arXiv feed: url={url}, updated={feed.feed.updated}, entries={len(feed.entries)}")
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers = []
@@ -127,6 +133,7 @@ class ArxivRetriever(BaseRetriever):
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+        logger.info(f"arXiv eligible announcements: {len(all_paper_ids)}; allowed types={sorted(allowed_announce_types)}")
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
